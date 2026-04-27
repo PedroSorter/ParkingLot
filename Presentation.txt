@@ -1,0 +1,35 @@
+I thought about a system that allows me to manage parking lots with customizable spot layouts (small, regular, and large). I want to park vehicles according to their type, vacate them when they leave, and check the lot status in real time. The system must enforce realistic parking rules: motorcycles can fit in any spot, cars need at least one regular spot, and vans require either one large spot or three consecutive regular spots.
+
+The application covers the entire lifecycle of a parking lot: creating lots, editing spot layouts (only when the lot is empty), parking and vacating vehicles, querying the status in real time, and deleting lots. A React frontend offers an easy-to-use management dashboard, and a separate User Access API shows authentication patterns with registration, login, and JWT-protected endpoints.
+
+The project shows clean architecture with a rich domain model, direct database access without ORM abstractions, test-driven development throughout all layers, a modern React frontend with type-safe API integration, and a self-contained Docker setup that a reviewer can clone and run in just three commands. 
+
+The Design Choices  
+As it was requested no Entity Framework, Dapper, and Mediator. All database access with raw Npgsql commands with parameterized queries. 
+Rich domain model over anemic DTOs. All parking logic is found in ParkingLotUnit, the aggregate root. The controller doesn’t decide where a vehicle parks or if a layout change is allowed; it asks the domain, which returns a result object. This keeps business rules testable without HTTP infrastructure.
+
+Test-Driven Development. Approach done with the Red-Green-Refactor cycle. Controller tests are in-memory. Frontend tests use Mock Service Worker to intercept API calls and testing library for use case assertions.
+
+Presentation with live API DOC (Swagger). Traditional ASP.NET Core controllers were chosen over minimal APIs for better discoverability and live documentation.
+Opted to use In-memory authentication for the second API to make it easier to complete and test 
+Used Docker Compose for the database to make it easier to test and distribute via Git.
+
+Technical Architecture  
+Solution Structure  
+ParkingLot/  
+├── src/  
+│   ├── ParkingLot.Core/           Domain entities, enums, interfaces  
+│   ├── ParkingLot.Infrastructure/  Npgsql repository, database migrator  
+│   ├── ParkingLot.Api/            ASP.NET Core controllers, Swagger  
+│   ├── UserAccess.Api/            JWT auth API (standalone)  
+│   └── ParkingLot.Web/            React + Vite + TypeScript frontend  
+├── tests/  
+│   ├── ParkingLot.Core.Tests/     Domain unit tests (xUnit)  
+│   └── ParkingLot.Api.Tests/      Controller unit tests (xUnit)  
+├── database/  
+│   ├── schema.sql                 Canonical schema reference  
+│   └── docker-init/               Docker entrypoint SQL scripts  
+│       ├── 001_schema.sql         Table creation (idempotent)  
+│       └── 002_seed.sql           Demo data with fixed UUIDs  
+├── docker-compose.yml             PostgreSQL 16 service  
+└── ParkingLot.sln  
