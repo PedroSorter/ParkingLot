@@ -1,0 +1,461 @@
+The Prompt I would use: 
+
+"Design the structure for a task management REST API with Node.js, Express, and Prisma (Postgres). Adhere to the concept of clean architecture by dividing the app into route, controller, service, validator, and middleware layers. Each task will have title (string, required), description (string, optional), status (enum: pending, in_progress, done), and due_date (date in ISO format, required). A Task belongs to a User model (presumed that User model with id, name, email, password_hash is created). Implement the following additional features: JWT authentication middleware, input validation via Zod, error handling using typed Error class, and pagination on list APIs. Employ test-driven development methodology: create failing tests first using Jest, then pass them with the implementation. React Frontend: Use the feature-slice approach: src/features/tasks/(api, model, ui, index.ts)."
+
+As I have a extensive collection of rules and skills that I included on my .cursor folder, the context would be complemented with the designs, architectures and code practices that I believe that are necessary to create a reliable and stable system.
+
+Skills: 
+
+-React Feature Slice: features/tasks/{api, model, ui, index.ts}, Zod schemas for responses, TanStack Query hooks, presentational components with props-in/JSX-out, RTL + MSW tests.
+-TDD Red-Green-Refactor: Tests shown first, then the implementation that makes them pass. Every edge case is a test case.
+-Clean layered architecture: inward-pointing dependencies — routes → controllers → services → Prisma, with validators and middleware as cross-cutting concerns.
+
+IA Validation:
+
+-AI often generates string for due_date without datetime validation so Zod .datetime() as a must corrected it
+-AI forgot ownership of user so I had to reenforce that users can only access their own tasks
+-Because of how the backend was structured and by using an Error object the system was returning raw Prisma errors to the client so the global ErrorHandler that was separating unknown errors from "AppErrors" 
+-AI used string for status instead of enums
+
+On edge cases: 
+
+Concurrent delete: any subsequent deletion returned 404
+SQL Injection: with prisma all queries are parameterizes, so no raw sql
+
+
+Output: 
+
+model User {
+  id            String   @id @default(uuid())
+  name          String
+  email         String   @unique
+  password_hash String
+  tasks         Task[]
+  created_at    DateTime @default(now())
+}
+model Task {
+  id          String     @id @default(uuid())
+  title       String
+  description String?
+  status      TaskStatus @default(pending)
+  due_date    DateTime
+  user_id     String
+  user        User       @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  created_at  DateTime   @default(now())
+  updated_at  DateTime   @updatedAt
+}
+enum TaskStatus {
+  pending
+  in_progress
+  done
+}
+
+Zod Validations: 
+
+import { z } from "zod";
+export const CreateTaskSchema = z.object({
+  title: z
+    .string()
+    .min(1, "Title is required")
+    .max(255, "Title must be 255 chars or fewer"),
+  description: z.string().max(2000).optional(),
+  status: z.enum(["pending", "in_progress", "done"]).default("pending"),
+  due_date: z
+    .string()
+    .datetime({ message: "Must be a valid ISO 8601 date" })
+    .refine(
+      (d) => new Date(d) > new Date(),
+      "Due date must be in the future"
+    ),
+});
+export const UpdateTaskSchema = CreateTaskSchema.partial().refine(
+  (data) => Object.keys(data).length > 0,
+  "At least one field must be provided"
+);
+export const TaskQuerySchema = z.object({
+  page: z.coerce.number().int().positive().default(1),
+  limit: z.coerce.number().int().min(1).max(100).default(20),
+  status: z.enum(["pending", "in_progress", "done"]).optional(),
+});
+
+Auth Middleware: 
+
+import { Request, Response, NextFunction } from "express";
+import jwt from "jsonwebtoken";
+export interface AuthRequest extends Request {
+  userId?: string;
+}
+export function authenticate(
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+) {
+  const header = req.headers.authorization;
+  if (!header?.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "Missing or malformed token" });
+  }
+  try {
+    const payload = jwt.verify(
+      header.slice(7),
+      process.env.JWT_SECRET!
+    ) as { sub: string };
+    req.userId = payload.sub;
+    next();
+  } catch {
+    return res.status(401).json({ error: "Invalid or expired token" });
+  }
+}
+
+Validation Middleware:
+
+import { Request, Response, NextFunction } from "express";
+import { ZodSchema, ZodError } from "zod";
+export function validate(schema: ZodSchema, source: "body" | "query" = "body") {
+  return (req: Request, res: Response, next: NextFunction) => {
+    try {
+      req[source] = schema.parse(req[source]);
+      next();
+    } catch (err) {
+      if (err instanceof ZodError) {
+        return res.status(400).json({
+          error: "Validation failed",
+          details: err.errors.map((e) => ({
+            path: e.path.join("."),
+            message: e.message,
+          })),
+        });
+      }
+      next(err);
+    }
+  };
+}
+
+Task Service:
+
+
+import { PrismaClient, Task } from "@prisma/client";
+import { NotFoundError, ForbiddenError } from "../errors";
+const prisma = new PrismaClient();
+interface CreateTaskInput {
+  title: string;
+  description?: string;
+  status?: "pending" | "in_progress" | "done";
+  due_date: string;
+}
+export async function createTask(
+  userId: string,
+  data: CreateTaskInput
+): Promise<Task> {
+  return prisma.task.create({
+    data: { ...data, due_date: new Date(data.due_date), user_id: userId },
+  });
+}
+export async function listTasks(
+  userId: string,
+  opts: { page: number; limit: number; status?: string }
+) {
+  const where = { user_id: userId, ...(opts.status && { status: opts.status as any }) };
+  const [tasks, total] = await Promise.all([
+    prisma.task.findMany({
+      where,
+      skip: (opts.page - 1) * opts.limit,
+      take: opts.limit,
+      orderBy: { due_date: "asc" },
+    }),
+    prisma.task.count({ where }),
+  ]);
+  return { tasks, total, page: opts.page, limit: opts.limit };
+}
+export async function getTask(taskId: string, userId: string): Promise<Task> {
+  const task = await prisma.task.findUnique({ where: { id: taskId } });
+  if (!task) throw new NotFoundError("Task not found");
+  if (task.user_id !== userId) throw new ForbiddenError("Access denied");
+  return task;
+}
+export async function updateTask(
+  taskId: string,
+  userId: string,
+  data: Partial<CreateTaskInput>
+): Promise<Task> {
+  const task = await getTask(taskId, userId);
+  return prisma.task.update({
+    where: { id: task.id },
+    data: {
+      ...data,
+      ...(data.due_date && { due_date: new Date(data.due_date) }),
+    },
+  });
+}
+export async function deleteTask(
+  taskId: string,
+  userId: string
+): Promise<void> {
+  await getTask(taskId, userId);
+  await prisma.task.delete({ where: { id: taskId } });
+}
+
+Routes:
+
+
+import { Router } from "express";
+import { authenticate } from "../middleware/auth.middleware";
+import { validate } from "../middleware/validate.middleware";
+import {
+  CreateTaskSchema,
+  UpdateTaskSchema,
+  TaskQuerySchema,
+} from "../validators/task.validator";
+import * as ctrl from "../controllers/task.controller";
+const router = Router();
+router.use(authenticate);
+router.post("/", validate(CreateTaskSchema), ctrl.create);
+router.get("/", validate(TaskQuerySchema, "query"), ctrl.list);
+router.get("/:id", ctrl.getById);
+router.patch("/:id", validate(UpdateTaskSchema), ctrl.update);
+router.delete("/:id", ctrl.remove);
+export default router;
+
+Custom Errors: 
+
+export class AppError extends Error {
+  constructor(public message: string, public statusCode: number) {
+    super(message);
+  }
+}
+export class NotFoundError extends AppError {
+  constructor(message = "Resource not found") {
+    super(message, 404);
+  }
+}
+export class ForbiddenError extends AppError {
+  constructor(message = "Forbidden") {
+    super(message, 403);
+  }
+}
+
+Global Error Handler: 
+
+import { Request, Response, NextFunction } from "express";
+import { AppError } from "../errors";
+export function errorHandler(
+  err: Error,
+  _req: Request,
+  res: Response,
+  _next: NextFunction
+) {
+  if (err instanceof AppError) {
+    return res.status(err.statusCode).json({ error: err.message });
+  }
+  console.error("Unhandled error:", err);
+  res.status(500).json({ error: "Internal server error" });
+}
+
+
+Backend Tests: 
+
+// __tests__/tasks.test.ts
+import request from "supertest";
+import { app } from "../src/app";
+import { prismaMock } from "./helpers/prisma-mock";
+import { generateToken } from "./helpers/auth";
+const token = generateToken("user-123");
+describe("POST /api/tasks", () => {
+  // RED: write failing test first
+  it("returns 400 when title is missing", async () => {
+    const res = await request(app)
+      .post("/api/tasks")
+      .set("Authorization", `Bearer ${token}`)
+      .send({ due_date: "2026-12-31T00:00:00Z" });
+    expect(res.status).toBe(400);
+    expect(res.body.details).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ path: "title", message: expect.any(String) }),
+      ])
+    );
+  });
+  it("returns 401 without a token", async () => {
+    const res = await request(app)
+      .post("/api/tasks")
+      .send({ title: "Test", due_date: "2026-12-31T00:00:00Z" });
+    expect(res.status).toBe(401);
+  });
+  it("creates a task and returns 201", async () => {
+    const taskData = {
+      title: "Finish report",
+      description: "Q2 summary",
+      due_date: "2026-12-31T00:00:00Z",
+    };
+    prismaMock.task.create.mockResolvedValue({
+      id: "task-1",
+      ...taskData,
+      status: "pending",
+      due_date: new Date(taskData.due_date),
+      user_id: "user-123",
+      created_at: new Date(),
+      updated_at: new Date(),
+    });
+    const res = await request(app)
+      .post("/api/tasks")
+      .set("Authorization", `Bearer ${token}`)
+      .send(taskData);
+    expect(res.status).toBe(201);
+    expect(res.body.title).toBe("Finish report");
+    expect(res.body.status).toBe("pending");
+  });
+  it("rejects due_date in the past", async () => {
+    const res = await request(app)
+      .post("/api/tasks")
+      .set("Authorization", `Bearer ${token}`)
+      .send({ title: "Old task", due_date: "2020-01-01T00:00:00Z" });
+    expect(res.status).toBe(400);
+    expect(res.body.details[0].message).toMatch(/future/i);
+  });
+
+Frontend Code: 
+
+import { z } from "zod";
+import { httpClient } from "@/shared/api/http-client";
+export const TaskSchema = z.object({
+  id: z.string().uuid(),
+  title: z.string(),
+  description: z.string().nullable(),
+  status: z.enum(["pending", "in_progress", "done"]),
+  due_date: z.string().datetime(),
+  created_at: z.string().datetime(),
+  updated_at: z.string().datetime(),
+});
+export const TaskListResponseSchema = z.object({
+  tasks: z.array(TaskSchema),
+  total: z.number(),
+  page: z.number(),
+  limit: z.number(),
+});
+export type Task = z.infer<typeof TaskSchema>;
+export async function fetchTasks(params: { page?: number; status?: string }) {
+  const res = await httpClient.get("/api/tasks", { params });
+  return TaskListResponseSchema.parse(res.data);
+}
+export async function createTask(data: {
+  title: string;
+  description?: string;
+  due_date: string;
+}) {
+  const res = await httpClient.post("/api/tasks", data);
+  return TaskSchema.parse(res.data);
+}
+export async function updateTask(id: string, data: Partial<Task>) {
+  const res = await httpClient.patch(`/api/tasks/${id}`, data);
+  return TaskSchema.parse(res.data);
+}
+export async function deleteTask(id: string) {
+  await httpClient.delete(`/api/tasks/${id}`);
+}
+
+Model Layer: 
+
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import * as api from "../api/tasks.api";
+export function useTasksQuery(params: { page?: number; status?: string }) {
+  return useQuery({
+    queryKey: ["tasks", params],
+    queryFn: () => api.fetchTasks(params),
+  });
+}
+export function useCreateTaskMutation() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: api.createTask,
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["tasks"] }),
+  });
+}
+export function useUpdateTaskMutation() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, ...data }: { id: string } & Partial<api.Task>) =>
+      api.updateTask(id, data),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["tasks"] }),
+  });
+}
+export function useDeleteTaskMutation() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: api.deleteTask,
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["tasks"] }),
+  });
+}
+
+Ui Layer: 
+
+import { Task } from "../api/tasks.api";
+interface TaskCardProps {
+  task: Task;
+  onEdit: (task: Task) => void;
+  onDelete: (id: string) => void;
+}
+const STATUS_LABELS: Record<Task["status"], string> = {
+  pending: "Pending",
+  in_progress: "In Progress",
+  done: "Done",
+};
+export function TaskCard({ task, onEdit, onDelete }: TaskCardProps) {
+  const isOverdue =
+    task.status !== "done" && new Date(task.due_date) < new Date();
+  return (
+    <div className={`task-card ${isOverdue ? "task-card--overdue" : ""}`}>
+      <h3>{task.title}</h3>
+      {task.description && <p>{task.description}</p>}
+      <span className={`badge badge--${task.status}`}>
+        {STATUS_LABELS[task.status]}
+      </span>
+      <time dateTime={task.due_date}>
+        Due: {new Date(task.due_date).toLocaleDateString()}
+      </time>
+      <div className="task-card__actions">
+        <button onClick={() => onEdit(task)}>Edit</button>
+        <button onClick={() => onDelete(task.id)}>Delete</button>
+      </div>
+    </div>
+  );
+}
+
+Exposing: 
+
+export { useTasksQuery, useCreateTaskMutation, useUpdateTaskMutation, useDeleteTaskMutation } from "./model/use-tasks";
+export { TaskCard } from "./ui/TaskCard";
+export type { Task } from "./api/tasks.api";
+
+Frontend Test: 
+
+// src/features/tasks/ui/__tests__/TaskCard.test.tsx
+import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { TaskCard } from "../TaskCard";
+const mockTask = {
+  id: "1",
+  title: "Write tests",
+  description: "Cover all CRUD operations",
+  status: "pending" as const,
+  due_date: "2026-12-31T00:00:00Z",
+  created_at: "2026-01-01T00:00:00Z",
+  updated_at: "2026-01-01T00:00:00Z",
+};
+describe("TaskCard", () => {
+  it("renders title and status", () => {
+    render(<TaskCard task={mockTask} onEdit={vi.fn()} onDelete={vi.fn()} />);
+    expect(screen.getByText("Write tests")).toBeInTheDocument();
+    expect(screen.getByText("Pending")).toBeInTheDocument();
+  });
+  it("calls onDelete when delete button is clicked", async () => {
+    const onDelete = vi.fn();
+    render(<TaskCard task={mockTask} onEdit={vi.fn()} onDelete={onDelete} />);
+    await userEvent.click(screen.getByText("Delete"));
+    expect(onDelete).toHaveBeenCalledWith("1");
+  });
+  it("marks overdue tasks visually", () => {
+    const overdue = { ...mockTask, due_date: "2020-01-01T00:00:00Z" };
+    const { container } = render(
+      <TaskCard task={overdue} onEdit={vi.fn()} onDelete={vi.fn()} />
+    );
+    expect(container.firstChild).toHaveClass("task-card--overdue");
+  });
+});
